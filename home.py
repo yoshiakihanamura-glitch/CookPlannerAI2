@@ -8,6 +8,8 @@ import streamlit as st
 from data_store import load_settings
 from inventory import load_inventory
 from planner import load_meal_plan
+from recipes import load_recipes
+from shopping import load_shopping
 
 
 def pregnancy_week(
@@ -25,7 +27,6 @@ def pregnancy_week(
     pregnancy_start_date = due_date - timedelta(
         days=280
     )
-
     elapsed_days = (
         date.today() - pregnancy_start_date
     ).days
@@ -39,19 +40,30 @@ def pregnancy_week(
     )
 
 
-def show_home() -> None:
-    """ホーム画面を表示する。"""
-    settings = load_settings()
-
-    husband_name = settings.get(
-        "husband_name",
-        "佳明",
+def _expiry_days(expiry_date: object) -> int | None:
+    parsed = pd.to_datetime(
+        expiry_date,
+        errors="coerce",
     )
+    if pd.isna(parsed):
+        return None
+    return (parsed.date() - date.today()).days
 
-    st.subheader(
-        f"おはよう、{husband_name}さん"
-    )
 
+def _expiry_message(expiry_date: object) -> str:
+    days = _expiry_days(expiry_date)
+    if days is None:
+        return "期限未設定"
+    if days < 0:
+        return f"期限切れ（{abs(days)}日前）"
+    if days == 0:
+        return "今日まで"
+    if days == 1:
+        return "明日まで"
+    return f"あと{days}日"
+
+
+def _show_today_meal() -> None:
     today = date.today().isoformat()
     meal_plan = load_meal_plan()
 
@@ -69,36 +81,94 @@ def show_home() -> None:
             "今日の献立はまだありません。"
             "献立画面から30日分を生成してください。"
         )
-    else:
-        columns = st.columns(3)
+        return
 
-        for column, category in zip(
-            columns,
-            ["主菜", "副菜", "汁物"],
-        ):
-            category_plan = today_plan[
-                today_plan["category"] == category
-            ]
+    columns = st.columns(3)
 
-            if category_plan.empty:
-                recipe_name = "未登録"
-            else:
-                recipe_name = str(
-                    category_plan.iloc[0][
-                        "recipe_name"
-                    ]
-                )
-
-            column.metric(
-                category,
-                recipe_name,
+    for column, category in zip(
+        columns,
+        ["主菜", "副菜", "汁物"],
+    ):
+        category_plan = today_plan[
+            today_plan["category"] == category
+        ]
+        recipe_name = (
+            "未登録"
+            if category_plan.empty
+            else str(
+                category_plan.iloc[0]["recipe_name"]
             )
+        )
+        column.metric(category, recipe_name)
 
-    st.markdown(
-        "### 🥦 今日使い切りたい食材"
+
+def show_home() -> None:
+    settings = load_settings()
+    inventory = load_inventory()
+    shopping = load_shopping()
+    recipes = load_recipes()
+
+    husband_name = settings.get(
+        "husband_name",
+        "佳明",
+    )
+    st.subheader(f"おはよう、{husband_name}さん")
+
+    shopping_remaining = 0
+    if not shopping.empty:
+        shopping_remaining = int(
+            (~shopping["checked"].astype(bool)).sum()
+        )
+
+    urgent_count = 0
+    expired_count = 0
+    if not inventory.empty:
+        expiry_days = inventory[
+            "expiry_date"
+        ].apply(_expiry_days)
+        urgent_count = int(
+            expiry_days.apply(
+                lambda value: (
+                    value is not None
+                    and 0 <= value <= 3
+                )
+            ).sum()
+        )
+        expired_count = int(
+            expiry_days.apply(
+                lambda value: (
+                    value is not None
+                    and value < 0
+                )
+            ).sum()
+        )
+
+    metrics = st.columns(4)
+    metrics[0].metric(
+        "冷蔵庫",
+        f"{len(inventory)}品",
+    )
+    metrics[1].metric(
+        "期限3日以内",
+        f"{urgent_count}品",
+    )
+    metrics[2].metric(
+        "買い物残り",
+        f"{shopping_remaining}件",
+    )
+    metrics[3].metric(
+        "登録レシピ",
+        f"{len(recipes)}件",
     )
 
-    inventory = load_inventory()
+    if expired_count:
+        st.error(
+            f"期限切れの食材が{expired_count}品あります。"
+        )
+
+    _show_today_meal()
+
+    st.markdown("### 🥦 今日使い切りたい食材")
 
     if inventory.empty:
         st.caption(
@@ -106,62 +176,47 @@ def show_home() -> None:
         )
     else:
         inventory = inventory.copy()
-
         inventory["expiry"] = pd.to_datetime(
             inventory["expiry_date"],
             errors="coerce",
         )
 
-        urgent_items = (
-            inventory.sort_values(
-                "expiry",
-                na_position="last",
-            )
-            .head(3)
-        )
+        urgent_items = inventory.sort_values(
+            "expiry",
+            na_position="last",
+        ).head(3)
 
         for _, item in urgent_items.iterrows():
-            ingredient_name = str(
-                item.get(
-                    "ingredient_name",
-                    "",
-                )
-            )
-
-            amount = str(
-                item.get(
-                    "amount",
-                    "",
-                )
-            )
-
-            unit = str(
-                item.get(
-                    "unit",
-                    "",
-                )
-            )
-
-            expiry_date = str(
-                item.get(
-                    "expiry_date",
-                    "",
-                )
-            )
-
             st.write(
-                f"・{ingredient_name} "
-                f"{amount}{unit} "
-                f"期限：{expiry_date}"
+                f"・{item['ingredient_name']} "
+                f"{item['amount']}{item['unit']}　"
+                f"{_expiry_message(item['expiry_date'])}"
+            )
+
+    st.markdown("### 🛒 買い物")
+    if shopping.empty:
+        st.caption(
+            "買い物リストはまだありません。"
+        )
+    elif shopping_remaining == 0:
+        st.success("買い物はすべて完了しています。")
+    else:
+        st.write(
+            f"未購入の食材が{shopping_remaining}件あります。"
+        )
+        pending = shopping[
+            ~shopping["checked"].astype(bool)
+        ].head(5)
+        for _, item in pending.iterrows():
+            st.write(
+                f"・{item['ingredient_name']} "
+                f"{item['amount']}{item['unit']}"
             )
 
     st.markdown("### 🤰 妊娠情報")
 
     week = pregnancy_week(
-        settings.get(
-            "due_date",
-            "",
-        )
+        settings.get("due_date", "")
     )
 
     if week is None:

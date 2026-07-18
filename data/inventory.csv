@@ -1,1 +1,2 @@
-﻿inventory_id,ingredient_name,amount,unit,expiry_date
+﻿inventory_id,ingredient_name,amount,unit,expiry_date,purchase_date,storage_location,note
+1,卵,7,個,2026-07-20,,,

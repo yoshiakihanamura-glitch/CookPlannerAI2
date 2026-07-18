@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import shutil
 from pathlib import Path
 
@@ -23,7 +22,16 @@ RECIPE_COLUMNS = [
 ]
 INGREDIENT_COLUMNS = ["recipe_id", "ingredient_name", "amount", "unit"]
 MEAL_PLAN_COLUMNS = ["date", "category", "recipe_id", "recipe_name"]
-INVENTORY_COLUMNS = ["inventory_id", "ingredient_name", "amount", "unit", "expiry_date"]
+INVENTORY_COLUMNS = [
+    "inventory_id",
+    "ingredient_name",
+    "amount",
+    "unit",
+    "expiry_date",
+    "purchase_date",
+    "storage_location",
+    "note",
+]
 SHOPPING_COLUMNS = ["ingredient_name", "amount", "unit", "checked"]
 SETTING_COLUMNS = ["key", "value"]
 
@@ -39,7 +47,7 @@ DEFAULT_SETTINGS = {
 
 
 def _migrate_legacy_files() -> None:
-    """旧版でプロジェクト直下にあったCSVをdataフォルダへ自動移動する。"""
+    """旧版でプロジェクト直下にあったCSVをdataフォルダへ自動コピーする。"""
     for filename in [
         "recipes.csv",
         "recipe_ingredients.csv",
@@ -56,7 +64,49 @@ def _migrate_legacy_files() -> None:
 
 def _ensure_csv(path: Path, columns: list[str]) -> None:
     if not path.exists():
-        pd.DataFrame(columns=columns).to_csv(path, index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=columns).to_csv(
+            path,
+            index=False,
+            encoding="utf-8-sig",
+        )
+
+
+def initialize_missing_only(path: Path, columns: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_csv(path, columns)
+
+
+def load_csv(
+    path: Path,
+    columns: list[str],
+    dtype: object | None = None,
+) -> pd.DataFrame:
+    initialize_missing_only(path, columns)
+
+    try:
+        dataframe = pd.read_csv(
+            path,
+            encoding="utf-8-sig",
+            dtype=dtype,
+        )
+    except (pd.errors.EmptyDataError, FileNotFoundError):
+        dataframe = pd.DataFrame(columns=columns)
+
+    # 旧バージョンのCSVにも新しい列を自動追加する。
+    for column in columns:
+        if column not in dataframe.columns:
+            dataframe[column] = ""
+
+    return dataframe[columns]
+
+
+def save_csv(dataframe: pd.DataFrame, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dataframe.to_csv(
+        path,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
 
 def initialize_data() -> None:
@@ -68,45 +118,54 @@ def initialize_data() -> None:
     _ensure_csv(SHOPPING_CSV, SHOPPING_COLUMNS)
     _ensure_csv(SETTINGS_CSV, SETTING_COLUMNS)
 
-    settings = load_csv(SETTINGS_CSV, SETTING_COLUMNS)
-    existing = set(settings["key"].astype(str)) if not settings.empty else set()
-    missing = [{"key": k, "value": v} for k, v in DEFAULT_SETTINGS.items() if k not in existing]
+    settings = load_csv(
+        SETTINGS_CSV,
+        SETTING_COLUMNS,
+        dtype=str,
+    ).fillna("")
+
+    existing = (
+        set(settings["key"].astype(str))
+        if not settings.empty
+        else set()
+    )
+
+    missing = [
+        {"key": key, "value": value}
+        for key, value in DEFAULT_SETTINGS.items()
+        if key not in existing
+    ]
+
     if missing:
-        settings = pd.concat([settings, pd.DataFrame(missing)], ignore_index=True)
+        settings = pd.concat(
+            [settings, pd.DataFrame(missing)],
+            ignore_index=True,
+        )
         save_csv(settings, SETTINGS_CSV)
-
-
-def load_csv(path: Path, columns: list[str], dtype: object | None = None) -> pd.DataFrame:
-    initialize_missing_only(path, columns)
-    try:
-        df = pd.read_csv(path, encoding="utf-8-sig", dtype=dtype)
-    except (pd.errors.EmptyDataError, FileNotFoundError):
-        df = pd.DataFrame(columns=columns)
-    for column in columns:
-        if column not in df.columns:
-            df[column] = ""
-    return df[columns]
-
-
-def initialize_missing_only(path: Path, columns: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _ensure_csv(path, columns)
-
-
-def save_csv(df: pd.DataFrame, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
 def load_settings() -> dict[str, str]:
     initialize_data()
-    df = load_csv(SETTINGS_CSV, SETTING_COLUMNS, dtype=str).fillna("")
+    dataframe = load_csv(
+        SETTINGS_CSV,
+        SETTING_COLUMNS,
+        dtype=str,
+    ).fillna("")
+
     result = DEFAULT_SETTINGS.copy()
-    for _, row in df.iterrows():
+
+    for _, row in dataframe.iterrows():
         result[str(row["key"])] = str(row["value"])
+
     return result
 
 
 def save_settings(values: dict[str, str]) -> None:
-    rows = [{"key": key, "value": str(value)} for key, value in values.items()]
-    save_csv(pd.DataFrame(rows, columns=SETTING_COLUMNS), SETTINGS_CSV)
+    rows = [
+        {"key": key, "value": str(value)}
+        for key, value in values.items()
+    ]
+    save_csv(
+        pd.DataFrame(rows, columns=SETTING_COLUMNS),
+        SETTINGS_CSV,
+    )
