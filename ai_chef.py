@@ -570,6 +570,11 @@ def show_ai_chef_page() -> None:
     st.info("コピーしてこのチャットへ送信し、返ってきたJSONを下へ丸ごと貼ってください。")
 
     st.markdown("### 3. ChatGPTの回答を貼る")
+    # Streamlitでは、同じ実行中に表示済みウィジェットの値を
+    # session_stateから直接変更できないため、次回実行の先頭で消す。
+    if st.session_state.pop("clear_free_ai_response", False):
+        st.session_state.pop("free_ai_response", None)
+
     response = st.text_area(
         "回答をそのまま貼り付け",
         value=st.session_state.get("free_ai_response", ""),
@@ -608,7 +613,7 @@ def show_ai_chef_page() -> None:
                 f" 新しいレシピ{result['recipes']}件、買い物{result['shopping']}件を反映しました。"
             )
             st.session_state.pop("parsed_ai_menu", None)
-            st.session_state["free_ai_response"] = ""
+            st.session_state["clear_free_ai_response"] = True
             st.rerun()
 
     history = _load_responses()
