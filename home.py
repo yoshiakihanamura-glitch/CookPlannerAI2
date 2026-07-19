@@ -5,6 +5,7 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import streamlit as st
 
+from cooking import cook_today_meal, today_is_cooked
 from data_store import load_settings
 from inventory import load_inventory
 from planner import load_meal_plan
@@ -63,7 +64,7 @@ def _expiry_message(expiry_date: object) -> str:
     return f"あと{days}日"
 
 
-def _show_today_meal() -> None:
+def _show_today_meal() -> pd.DataFrame:
     today = date.today().isoformat()
     meal_plan = load_meal_plan()
 
@@ -81,7 +82,7 @@ def _show_today_meal() -> None:
             "今日の献立はまだありません。"
             "献立画面から30日分を生成してください。"
         )
-        return
+        return today_plan
 
     columns = st.columns(3)
 
@@ -100,6 +101,40 @@ def _show_today_meal() -> None:
             )
         )
         column.metric(category, recipe_name)
+
+    return today_plan
+
+
+def _show_cook_button(today_plan: pd.DataFrame) -> None:
+    if today_plan.empty:
+        return
+
+    if today_is_cooked():
+        st.success("今日の献立は調理済みです。冷蔵庫の残量も更新されています。")
+        return
+
+    if st.button(
+        "🍳 今日の献立を作った！",
+        type="primary",
+        use_container_width=True,
+    ):
+        result = cook_today_meal()
+        status = result.get("status")
+        if status == "success":
+            st.success(str(result.get("message", "更新しました。")))
+            shortages = result.get("shortages", [])
+            if shortages:
+                shortage_text = "、".join(
+                    f"{item['ingredient_name']} {item['amount']}{item['unit']}"
+                    for item in shortages
+                )
+                st.warning(
+                    "冷蔵庫で不足していた材料：" + shortage_text
+                    + "。買い物リストを更新してください。"
+                )
+            st.rerun()
+        else:
+            st.warning(str(result.get("message", "更新できませんでした。")))
 
 
 def show_home() -> None:
@@ -166,7 +201,8 @@ def show_home() -> None:
             f"期限切れの食材が{expired_count}品あります。"
         )
 
-    _show_today_meal()
+    today_plan = _show_today_meal()
+    _show_cook_button(today_plan)
 
     st.markdown("### 🥦 今日使い切りたい食材")
 

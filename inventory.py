@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -42,6 +42,70 @@ def _format_amount(value: object) -> str:
     if number.is_integer():
         return str(int(number))
     return f"{number:g}"
+
+
+def _adjustment_step(unit: object) -> float:
+    """食材単位に合わせたワンタップ増減量を返す。"""
+    normalized = str(unit).strip()
+    if normalized in {"g", "ml"}:
+        return 50.0
+    if normalized in {"kg", "L"}:
+        return 0.1
+    return 1.0
+
+
+def _update_amount(
+    dataframe: pd.DataFrame,
+    inventory_id: int,
+    new_amount: float,
+) -> pd.DataFrame:
+    """指定ロットの数量を更新し、0以下なら削除する。"""
+    ids = pd.to_numeric(
+        dataframe["inventory_id"],
+        errors="coerce",
+    )
+    target = ids == inventory_id
+
+    if new_amount <= 0:
+        updated = dataframe[~target].copy()
+    else:
+        updated = dataframe.copy()
+        updated.loc[target, "amount"] = _format_amount(new_amount)
+
+    save_csv(updated[INVENTORY_COLUMNS], INVENTORY_CSV)
+    return updated
+
+
+def _rebuild_plan_and_shopping() -> tuple[int, int]:
+    """現在の在庫を基準に今日以降の献立と買い物を作り直す。"""
+    # 循環importを避けるため、ボタンを押した時だけ読み込む。
+    from data_store import SHOPPING_CSV, load_settings
+    from planner import rebuild_future_plan
+    from shopping import build_shopping_list
+
+    rebuilt = rebuild_future_plan(
+        start=date.today(),
+        use_inventory=True,
+    )
+    settings = load_settings()
+    try:
+        shopping_days = int(
+            settings.get("shopping_cycle_days", "3")
+        )
+    except ValueError:
+        shopping_days = 3
+
+    shopping_days = min(max(shopping_days, 1), 7)
+    shopping = build_shopping_list(shopping_days)
+    save_csv(shopping, SHOPPING_CSV)
+
+    future_dates = rebuilt[
+        pd.to_datetime(
+            rebuilt["date"],
+            errors="coerce",
+        ).dt.date >= date.today()
+    ]["date"].nunique()
+    return int(future_dates), len(shopping)
 
 
 def _next_inventory_id(dataframe: pd.DataFrame) -> int:
@@ -93,11 +157,50 @@ def _save_editor_result(edited: pd.DataFrame) -> None:
     save_csv(updated, INVENTORY_CSV)
 
 
+def _reset_inventory_with_backup(dataframe: pd.DataFrame) -> str | None:
+    """既存在庫をバックアップして冷蔵庫を空にする。"""
+    backup_path = None
+    if not dataframe.empty:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = INVENTORY_CSV.parent / f"inventory_backup_{timestamp}.csv"
+        save_csv(dataframe[INVENTORY_COLUMNS], backup_path)
+
+    empty = pd.DataFrame(columns=INVENTORY_COLUMNS)
+    save_csv(empty, INVENTORY_CSV)
+    return str(backup_path) if backup_path else None
+
+
 def show_inventory_page() -> None:
     st.subheader("📦 冷蔵庫")
-    st.caption("食材の登録、残量更新、賞味期限管理をまとめて行えます。")
+    st.caption("食材の登録、残量更新、消費目安日の管理をまとめて行えます。")
 
     dataframe = load_inventory()
+
+    with st.expander("🚀 初回セットアップ（最初に1回だけ）"):
+        st.write(
+            "既に家にある食材は期限や購入日が分からないため、"
+            "このアプリでは冷蔵庫を空の状態から開始します。"
+        )
+        st.write(
+            "今後は買い物リストの『購入済みを冷蔵庫へ一括追加』から登録します。"
+        )
+        confirm_reset = st.checkbox(
+            "現在の冷蔵庫データを空にすることを確認しました",
+            key="confirm_inventory_reset",
+        )
+        if st.button(
+            "冷蔵庫をまっさらにして開始",
+            disabled=not confirm_reset,
+            use_container_width=True,
+        ):
+            backup_path = _reset_inventory_with_backup(dataframe)
+            if backup_path:
+                st.success(
+                    "冷蔵庫を空にしました。以前のデータはバックアップ済みです。"
+                )
+            else:
+                st.success("冷蔵庫はすでに空です。ここから開始できます。")
+            st.rerun()
 
     today = date.today()
     expiry_days = dataframe["expiry_date"].apply(
@@ -119,6 +222,23 @@ def show_inventory_page() -> None:
     metric_total.metric("登録食材", f"{len(dataframe)}件")
     metric_urgent.metric("3日以内", f"{urgent_count}件")
     metric_expired.metric("期限切れ", f"{expired_count}件")
+
+    st.markdown("### 🔄 現実の在庫に合わせる")
+    st.caption(
+        "数量を直したあとに押すと、今日以降の献立だけを作り直し、"
+        "買い物リストも自動で更新します。過去の献立は変更しません。"
+    )
+    if st.button(
+        "🔄 この在庫で献立を立て直す",
+        type="primary",
+        use_container_width=True,
+    ):
+        future_days, shopping_count = _rebuild_plan_and_shopping()
+        st.success(
+            f"今日以降{future_days}日分の献立を立て直し、"
+            f"買い物リストを{shopping_count}件に更新しました。"
+        )
+        st.rerun()
 
     st.markdown("### 食材を追加")
 
@@ -279,6 +399,73 @@ def show_inventory_page() -> None:
 
                 inventory_id = int(float(item["inventory_id"]))
 
+                current_amount = _to_number(item["amount"])
+                step = _adjustment_step(item["unit"])
+
+                st.markdown("#### 実際の残量に合わせる")
+                if current_amount is None:
+                    st.warning(
+                        "現在量が数字ではありません。下の直接入力で修正してください。"
+                    )
+                else:
+                    adjust_columns = st.columns([1, 1.4, 1])
+                    if adjust_columns[0].button(
+                        f"−{_format_amount(step)}{item['unit']}",
+                        key=f"minus_{inventory_id}",
+                        use_container_width=True,
+                    ):
+                        _update_amount(
+                            dataframe,
+                            inventory_id,
+                            current_amount - step,
+                        )
+                        st.rerun()
+
+                    adjust_columns[1].metric(
+                        "現在の残量",
+                        f"{amount_text}{item['unit']}",
+                    )
+
+                    if adjust_columns[2].button(
+                        f"＋{_format_amount(step)}{item['unit']}",
+                        key=f"plus_{inventory_id}",
+                        use_container_width=True,
+                    ):
+                        _update_amount(
+                            dataframe,
+                            inventory_id,
+                            current_amount + step,
+                        )
+                        st.rerun()
+
+                with st.form(f"overwrite_{inventory_id}"):
+                    overwrite_columns = st.columns([2, 1])
+                    actual_amount = overwrite_columns[0].text_input(
+                        "実際の残量を直接入力",
+                        value=amount_text,
+                        key=f"actual_amount_{inventory_id}",
+                    )
+                    overwrite_clicked = overwrite_columns[1].form_submit_button(
+                        "この数量に修正",
+                        use_container_width=True,
+                    )
+
+                if overwrite_clicked:
+                    corrected_amount = _to_number(actual_amount)
+                    if corrected_amount is None or corrected_amount < 0:
+                        st.error("0以上の数字を入力してください。")
+                    else:
+                        _update_amount(
+                            dataframe,
+                            inventory_id,
+                            corrected_amount,
+                        )
+                        st.success(
+                            f"実際の残量を{_format_amount(corrected_amount)}"
+                            f"{item['unit']}に修正しました。"
+                        )
+                        st.rerun()
+
                 with st.form(f"consume_{inventory_id}"):
                     consume_columns = st.columns([2, 1])
                     consume_amount = consume_columns[0].text_input(
@@ -292,29 +479,28 @@ def show_inventory_page() -> None:
                     )
 
                 if consume_clicked:
-                    current_amount = _to_number(item["amount"])
                     used_amount = _to_number(consume_amount)
 
                     if current_amount is None:
-                        st.error("この食材の現在量が数字ではないため、編集画面で数量を直してください。")
+                        st.error(
+                            "現在量が数字ではないため、先に実際の残量を入力してください。"
+                        )
                     elif used_amount is None or used_amount <= 0:
                         st.error("使用した量を0より大きい数字で入力してください。")
                     else:
                         remaining = current_amount - used_amount
-                        id_values = pd.to_numeric(
-                            dataframe["inventory_id"],
-                            errors="coerce",
+                        _update_amount(
+                            dataframe,
+                            inventory_id,
+                            remaining,
                         )
-                        target = id_values == inventory_id
-
                         if remaining <= 0:
-                            dataframe = dataframe[~target]
                             st.success("使い切ったため、冷蔵庫から削除しました。")
                         else:
-                            dataframe.loc[target, "amount"] = _format_amount(remaining)
-                            st.success(f"残量を{_format_amount(remaining)}{item['unit']}に更新しました。")
-
-                        save_csv(dataframe, INVENTORY_CSV)
+                            st.success(
+                                f"残量を{_format_amount(remaining)}"
+                                f"{item['unit']}に更新しました。"
+                            )
                         st.rerun()
 
                 action_columns = st.columns(2)
